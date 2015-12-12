@@ -2,67 +2,75 @@ package com.github.waterlink.atom
 
 import java.time
 
-import akka.actor.{ActorSystem, Actor, ActorRef, Props}
-import akka.cluster.{Cluster, Member, RootActorPath}
+import concurrent.Future
+import concurrent.duration._
+import concurrent.ExecutionContext.Implicits.global
+
+import akka.actor.{ActorSystem, Actor, ActorRef, Props, RootActorPath}
+import akka.cluster.{Cluster, Member}
 import akka.cluster.ClusterEvent.{MemberEvent, MemberUp, MemberRemoved}
-import akka.pattern.ask._
+import akka.pattern.ask
+import akka.util.Timeout
 
 case object GetAtomValue
 case class AtomValue[T](name: String, value: T, modified: time.Instant)
 case class SetAtomValue[T](value: T, modified: time.Instant)
 
-class Atom[T](name: String, value: T, system: ActorSystem, clock: time.Clock) {
+class Atom[T](name: String, value: T, system: ActorSystem, clock: time.Clock, timeout: Timeout) {
+  implicit val tm = timeout
+
   val actor = system.actorOf(
-    Props[AtomActor],
-    "com" / "github" / "waterlink" / "atom" / "atoms" /
-    name
+    Props[AtomActor[T]],
+    s"com/github/waterlink/atom/atoms/$name"
   )
 
   def get: Future[T] = {
     val fut = actor ? GetAtomValue
     fut.map {
-      case AtomValue[T](name, value, modified) => value
+      case a: AtomValue[T] => a.value
     }
   }
 
   def set(value: T): Future[T] = {
     val fut = actor ? SetAtomValue(value, clock.instant)
     fut.map {
-      case AtomValue[T](name, value, modified) => value
+      case a: AtomValue[T] => a.value
     }
   }
 }
 
-object Atom[T] {
-  def apply(name: String, value: T)(implicit system: ActorSystem, clock: time.Clock) = {
-    new Atom[T](name, value, system)
+object Atom {
+  def apply[T](name: String, value: T)(implicit system: ActorSystem, clock: time.Clock, timeout: Timeout) = {
+    new Atom[T](name, value, system, clock, timeout)
   }
 }
 
-class AtomActor[T](name: String, initialValue: T, clock: time.Clock) extends Actor {
+class AtomActor[T](name: String, initialValue: T, clock: time.Clock, timeout: Timeout) extends Actor {
+  implicit val tm = timeout
   val cluster = Cluster(context.system)
 
   var value = initialValue
   var modified = clock.instant
-  var members = IndexedSeq.empty[String]
+  var members = IndexedSeq.empty[Member]
 
-  override def preStart: Unit = cluster.subscribe(
-    self,
-    classOf[MemberEvent],
-    )
+  override def preStart: Unit = cluster.subscribe(self, classOf[MemberEvent])
   override def postStop: Unit = cluster.unsubscribe(self)
 
   def receive = {
     case GetAtomValue => sendBackValue
-    case SetAtomValue(newValue, newModified) if newModified.isAfter(modified) =>
-      modify(newValue, newModified)
+    case s: SetAtomValue[T] => setValue(s)
     case MemberUp(m) => addMember(m)
-    case MemberRemoved(m) => removeMember(m)
+    case MemberRemoved(m, _) => removeMember(m)
     case _: MemberEvent => // ignore
   }
 
   def sendBackValue = {
     sender ! AtomValue[T](name, value, modified)
+  }
+
+  def setValue(s: SetAtomValue[T]) = s match {
+    case SetAtomValue(newValue, newModified) if newModified.isAfter(modified) =>
+      modify(newValue, newModified)
   }
 
   def modify(newValue: T, newModified: time.Instant) = {
@@ -73,25 +81,23 @@ class AtomActor[T](name: String, initialValue: T, clock: time.Clock) extends Act
   }
 
   def sendValueToMembers = {
-    for (m <- members) {
-      sendValueToMember(m)
-    }
+    members.foreach(sendValueToMember)
   }
 
-  def sendValueToMember(m: String) = {
+  def sendValueToMember(m: Member): Unit = {
     val fut = context.actorSelection(
-      RootActorPath(m) /
+      RootActorPath(m.address) /
       "com" / "github" / "waterlink" / "atom" / "atoms" /
       name
     ) ? SetAtomValue[T](value, modified)
-    fut.onFailure { sendValueToMember(m) }
+    fut.onFailure { case _ => sendValueToMember(m) }
   }
 
   def addMember(member: Member) = {
-    members = members :+ member.address
+    members = members :+ member
   }
 
-  def addMember(member: Member) = {
-    members = members.filterNot(_ == member.address)
+  def removeMember(member: Member) = {
+    members = members.filterNot(_ == member)
   }
 }
